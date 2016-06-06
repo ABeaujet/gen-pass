@@ -1,4 +1,4 @@
 all:
-	gcc -o genPass -g main.c -lssl -lcrypto
+	gcc -o gen-pass -g main.c -lssl -lcrypto
 clean:
-	rm genPass
+	rm gen-pass
