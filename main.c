@@ -16,9 +16,10 @@
 
 /**
   * Usage :
-  * ./myPass [-drUlnXx] sitename.com [pass_size]
+  * ./gen-pass [-dUlnXx] sitename.com [pass_size]
   * 
-  * TODO: Implémenter une base de donnée des changements de noms des sites.
+  * TODO: Register domain name changes in db
+  * TODO: Add password size in db
   */
 
 #define TYPE_UPPER		0x01	// U
@@ -27,8 +28,10 @@
 #define TYPE_SPECIAL	0x08	// s (U+n = X, l+n = x)
 #define TYPE_ALL		(TYPE_UPPER | TYPE_LOWER | TYPE_SPECIAL | TYPE_NUMBER)
 
+bool debug = false;
+
 void print_usage(){
-	printf("Usage : ./myPass [-drUlnXxs] [-L pass_size] sitename.com\n");
+	printf("Usage : ./gen-pass [-dUlnXxs] [-L pass_size] sitename.com\n");
 	printf("Note : (http(s)://)(www.) will be automatically trimmed.\n");
 }
 
@@ -69,15 +72,13 @@ char get_ascii_char(unsigned int pass_type, int index){
 
 	for(int i =0;i<list_count;i++)
 		if(pass_type & 1 << i)
-			if(index < sizes[i]){
-				printf("0x%02x:%c:%d:%d - ", lists[i][index], lists[i][index], i, index);
+			if(index < sizes[i])
 				return lists[i][index];
-			}
 			else
 				index -= sizes[i];
 
 	printf("What the fuck\n");
-	return -128;
+	return -128; // whatever
 }
 
 void gen_pass(char* master_pass, char* site_name, char* res, int out_len, unsigned int pass_type){
@@ -89,16 +90,19 @@ void gen_pass(char* master_pass, char* site_name, char* res, int out_len, unsign
 	unsigned char sha_master[33] = {'\0'};
 	memcpy(sha_site, SHA256(site_name, strlen(site_name), NULL), 32);
 	memcpy(sha_master, SHA256(master_pass, strlen(master_pass), NULL), 32);
-	printf("Domain hash : ");
-	print_hash(sha_site, 32);
-	printf("Master hash : ");
-	print_hash(sha_master, 32);
+
+	if(debug){
+		printf("Domain hash : ");
+		print_hash(sha_site, 32);
+		printf("Master hash : ");
+		print_hash(sha_master, 32);
+	}
+
 	for(int i = 0;i<32;i++){
 		out_i = i%out_len;
-		printf("%d,", out_i);
 		res[out_i] = get_ascii_char(pass_type, (res[out_i] + sha_site[i] + sha_master[i]));
 	}
-	//res[out_len] = '\0';
+	res[out_len] = '\0';
 }
 
 char* trim_url(char* in){
@@ -213,7 +217,6 @@ int main(int argc, char* argv[]){
 		return EXIT_FAILURE;
 	}
 
-	bool debug = false;
 	bool edit_website = false;
 	int pass_len = 10;
 	unsigned int pass_type = TYPE_ALL;
@@ -288,15 +291,17 @@ int main(int argc, char* argv[]){
 */
 	char *domain = trim_url(argv[index]);
 
-	printf("Options : %u\n", pass_type);
-	printf ("Domain : %s\n", domain);
+	if(debug)
+		printf("Options : %u\n", pass_type);
+
+	printf("Domain : %s\n", domain);
 
 	unsigned int old_pass_type;
 	int err = get_website_requirements(domain, &old_pass_type);
 	if(err == 0){
 		if(edit_website && default_config == false){
 			do{
-				printf("replacing password type for website %s : %d -> %d ? (y/n) ", domain, old_pass_type, pass_type);
+				printf("Replacing password type for website %s : %d -> %d ? (y/n) ", domain, old_pass_type, pass_type);
 				c = getchar();
 				putchar('\n');
 			}while(c != 'y' && c != 'n');
@@ -304,15 +309,15 @@ int main(int argc, char* argv[]){
 			if(c == 'y'){
 				if(	remove_website_requirement(domain) == EXIT_SUCCESS && 
 					register_website_requirements(domain, pass_type) == EXIT_SUCCESS)
-					printf("Website config updated : \n");
+					printf("Website config updated. ");
 				else{
-					printf("Error while updating website config. Aborting.\n");
+					fprintf(stderr, "Error while updating website config. Aborting.\n");
 					exit(EXIT_FAILURE);
 				}
 			}else
 				printf("Change aborted.\n");
 		}else{
-			printf("Website already registered : ");
+			printf("Website already registered. ");
 			pass_type = old_pass_type;
 		}
 
@@ -322,7 +327,7 @@ int main(int argc, char* argv[]){
 		if(register_website_requirements(domain, pass_type) == EXIT_SUCCESS)
 			printf("Website config inseted\n");
 		else{
-			printf("Error while inserting website config. Aborting.\n");
+			fprintf(stderr, "Error while inserting website config. Aborting.\n");
 			exit(EXIT_FAILURE);
 		}
 	}
