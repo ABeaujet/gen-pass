@@ -50,7 +50,7 @@ char get_ascii_char(unsigned int pass_type, int index){
 	static const char lower[] = {'a','b','c','d','e','f','g','h','i','j','k','l','m','n','o','p','q','r','s','t','u','v','w','x','y','z'};
 	#define lower_size 26
 
-	static const char num[] = {'0','1','2','3','4','5','6','7','9'};
+	static const char num[] = {'0','1','2','3','4','5','6','7','8','9'};
 	#define num_size 10
 
 	static const char const * lists[] = { upper, lower, num, special, NULL};
@@ -69,8 +69,10 @@ char get_ascii_char(unsigned int pass_type, int index){
 
 	for(int i =0;i<list_count;i++)
 		if(pass_type & 1 << i)
-			if(index < sizes[i])
+			if(index < sizes[i]){
+				printf("0x%02x:%c:%d:%d - ", lists[i][index], lists[i][index], i, index);
 				return lists[i][index];
+			}
 			else
 				index -= sizes[i];
 
@@ -93,9 +95,10 @@ void gen_pass(char* master_pass, char* site_name, char* res, int out_len, unsign
 	print_hash(sha_master, 32);
 	for(int i = 0;i<32;i++){
 		out_i = i%out_len;
+		printf("%d,", out_i);
 		res[out_i] = get_ascii_char(pass_type, (res[out_i] + sha_site[i] + sha_master[i]));
 	}
-	res[out_len] = '\0';
+	//res[out_len] = '\0';
 }
 
 char* trim_url(char* in){
@@ -143,22 +146,64 @@ int get_website_requirements(const char* domain, unsigned int *pass_type){
 		char current_domain[100] = {'\0'};
 		unsigned int current_requirement;
 		char* delim = strchr(current_line, ':');
-		if(delim == NULL)
+		if(delim == NULL){
+			fclose(config);
 			goto fail;
+		}
 		current_requirement = strtol(delim+1, NULL, 10);
-		if(errno == EINVAL)
+		if(errno == EINVAL){
+			fclose(config);
 			goto fail;
+		}
 		memcpy(current_domain, current_line, delim-current_line);
 		if(strcmp(domain, current_domain) == 0){
 			*pass_type = current_requirement;
+			fclose(config);
 			return 0;
 		}
 	}
+	fclose(config);
 	return 1;
 
 fail:
 	fprintf(stderr, "Missing or corrupted syntax in config file.\n");
 	return -1;
+}
+
+int remove_website_requirement(const char* domain){
+	const char config_file[] = "./websites.lst";
+	const char tmp_file[] = "./websites.lst.tmp";
+	FILE* config = fopen(config_file, "r+");
+	FILE* tmp = fopen(tmp_file, "w");
+	if(config == NULL)
+		goto fail;
+
+	char* current_line = NULL;
+	size_t current_line_size = 0;
+	while(getline(&current_line, &current_line_size, config) >= 0){
+		if(strlen(current_line) < 3) continue;
+
+		char current_domain[100] = {'\0'};
+		char* delim = strchr(current_line, ':');
+		if(delim == NULL){
+			fclose(config);
+			goto fail;
+		}
+		memcpy(current_domain, current_line, delim-current_line);
+		if(strcmp(domain, current_domain) != 0)
+			fprintf(tmp, "%s", current_line);
+	}
+	fclose(config);
+	fclose(tmp);
+	if(rename(tmp_file, config_file) == 0)
+		return EXIT_SUCCESS;
+	else{
+		fprintf(stderr, "Error while removing old website config.\n");
+	}
+
+fail:
+	fprintf(stderr, "Missing or corrupted syntax in config file.\n");
+	return EXIT_FAILURE;
 }
 
 int main(int argc, char* argv[]){
@@ -169,7 +214,7 @@ int main(int argc, char* argv[]){
 	}
 
 	bool debug = false;
-	bool register_website = false;
+	bool edit_website = false;
 	int pass_len = 10;
 	unsigned int pass_type = TYPE_ALL;
 	bool default_config = true;
@@ -178,39 +223,42 @@ int main(int argc, char* argv[]){
 	int c;
 
 	opterr = 0;
-	while ((c = getopt (argc, argv, "rdUlnXxsL:")) != -1){
+	while ((c = getopt (argc, argv, "dUlnXxsL:")) != -1){
 		switch (c){
 			case 'd':
 				debug = true;
 				break;
-			case 'r':
-				register_website = true;
-				break;
 			case 'U':
 				IF_DEFAULT_RESET
 				pass_type |= TYPE_UPPER;
+				edit_website = true;
 				break;
 			case 'l':
 				IF_DEFAULT_RESET
 				pass_type |= TYPE_LOWER;
+				edit_website = true;
 				break;
 			case 'n':
 				IF_DEFAULT_RESET
 				pass_type |= TYPE_NUMBER;
+				edit_website = true;
 				break;
 			case 'x':
 				IF_DEFAULT_RESET
 				pass_type |= TYPE_LOWER;
 				pass_type |= TYPE_NUMBER;
+				edit_website = true;
 				break;
 			case 'X':
 				IF_DEFAULT_RESET
 				pass_type |= TYPE_UPPER;
 				pass_type |= TYPE_NUMBER;
+				edit_website = true;
 				break;
 			case 's':
 				IF_DEFAULT_RESET
 				pass_type |= TYPE_SPECIAL;
+				edit_website = true;
 				break;
 			case 'L':
 				pass_len = strtol(optarg, NULL, 10);
@@ -243,13 +291,42 @@ int main(int argc, char* argv[]){
 	printf("Options : %u\n", pass_type);
 	printf ("Domain : %s\n", domain);
 
-	if(register_website)
-		return register_website_requirements(domain, pass_type);
+	unsigned int old_pass_type;
+	int err = get_website_requirements(domain, &old_pass_type);
+	if(err == 0){
+		if(edit_website && default_config == false){
+			do{
+				printf("replacing password type for website %s : %d -> %d ? (y/n) ", domain, old_pass_type, pass_type);
+				c = getchar();
+				putchar('\n');
+			}while(c != 'y' && c != 'n');
 
-	int err = get_website_requirements(domain, &pass_type);
-	if(err == 0)
-		printf("Website already registered with the following requirements : %u\n", pass_type);
-	if(err < 0)
+			if(c == 'y'){
+				if(	remove_website_requirement(domain) == EXIT_SUCCESS && 
+					register_website_requirements(domain, pass_type) == EXIT_SUCCESS)
+					printf("Website config updated : \n");
+				else{
+					printf("Error while updating website config. Aborting.\n");
+					exit(EXIT_FAILURE);
+				}
+			}else
+				printf("Change aborted.\n");
+		}else{
+			printf("Website already registered : ");
+			pass_type = old_pass_type;
+		}
+
+		printf("Using password type : %u\n", pass_type);
+	}
+	else if(err == 1){
+		if(register_website_requirements(domain, pass_type) == EXIT_SUCCESS)
+			printf("Website config inseted\n");
+		else{
+			printf("Error while inserting website config. Aborting.\n");
+			exit(EXIT_FAILURE);
+		}
+	}
+	else
 		return EXIT_FAILURE;
 
 	char master_pass[100] = {'\0'};
