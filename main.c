@@ -8,27 +8,37 @@
 #include <yaml.h>
 #include <openssl/sha.h>
 
-#define ASCII_START 32
-#define ASCII_END	126
-#define ASCII_RANGE (ASCII_END-ASCII_START+1) // +1 since inclusive
+#include "debug_tools.h"
+
 #define MIN(x, y) ( (x < y) ? x : y)
 #define MAX(x, y) ( (x > y) ? x : y)
 
 /**
   * Usage :
-  * ./gen-pass [-dUlnXx] sitename.com [pass_size]
+  * ./gen-pass [-dUlnXx] [-L pass_size] sitename.com
   * 
   * TODO: Register domain name changes in db
-  * TODO: Add password size in db
+  *       Or maybe just *replace* the line ?
+  * TODO: Change the display of password types from numbers to nice-looking list of checked and unchecked char classes.
   */
 
+// PASSWORD TYPE MASK VALUES
 #define TYPE_UPPER		0x01	// U
 #define TYPE_LOWER		0x02	// l
 #define TYPE_NUMBER		0x04	// n
 #define TYPE_SPECIAL	0x08	// s (U+n = X, l+n = x)
 #define TYPE_ALL		(TYPE_UPPER | TYPE_LOWER | TYPE_SPECIAL | TYPE_NUMBER)
 
+// GLOBALS
 bool debug = false;
+
+// TYPEDEFS
+typedef struct {
+	unsigned int type;
+	unsigned int length;
+} password_requirement_t;
+
+// THE BEEF
 
 void print_usage(){
 	printf("Usage : ./gen-pass [-dUlnXxs] [-L pass_size] sitename.com\n");
@@ -42,8 +52,7 @@ void print_hash(const unsigned char* in, size_t len){
 	putchar('\n');
 }
 
-// % ASCII_RANGE + ASCII_START;		
-char get_ascii_char(unsigned int pass_type, int index){
+char get_ascii_char(password_requirement_t pass_req, int index){
 	static const char special[] = {'!', '"', '#', '$', '%', '&', '\'', '(', ')', '*', '+', ',', '-', '.', '/', ':', ';', '<', '=', '>', '?', '@', '[', '\\', ']', '^', '_', '`', '{', '|', '}', '~' };
 	#define special_size 32
 
@@ -61,7 +70,7 @@ char get_ascii_char(unsigned int pass_type, int index){
 	static const int list_count = 4;
 
 	int modulo = 0;
-	unsigned int pass_type2 = pass_type;
+	unsigned int pass_type2 = pass_req.type;
 	for(int i =0;i<list_count;i++){
 		if(pass_type2 & 0x01)
 			modulo += sizes[i];
@@ -71,38 +80,36 @@ char get_ascii_char(unsigned int pass_type, int index){
 	index %= modulo;
 
 	for(int i =0;i<list_count;i++)
-		if(pass_type & 1 << i)
+		if(pass_req.type & 1 << i)
 			if(index < sizes[i])
 				return lists[i][index];
 			else
 				index -= sizes[i];
 
 	printf("What the fuck\n");
-	return -128; // whatever
+	return -128; // whatever, can't happen. I should have not said that.
 }
 
-void gen_pass(char* master_pass, char* site_name, char* res, int out_len, unsigned int pass_type){
+void gen_pass(char* master_pass, char* site_name, char* res, password_requirement_t pass_req){
 	char* c = site_name;
 	if(res == NULL)
-		res = calloc(out_len + 1, 1);
+		res = calloc(pass_req.length + 1, 1);
 	int out_i = 0;
 	unsigned char sha_site[33] = {'\0'};
 	unsigned char sha_master[33] = {'\0'};
 	memcpy(sha_site, SHA256(site_name, strlen(site_name), NULL), 32);
 	memcpy(sha_master, SHA256(master_pass, strlen(master_pass), NULL), 32);
 
-	if(debug){
-		printf("Domain hash : ");
-		print_hash(sha_site, 32);
-		printf("Master hash : ");
-		print_hash(sha_master, 32);
-	}
+	_dprint("Domain hash : ");
+	if(debug) print_hash(sha_site, 32);
+	_dprint("Master hash : ");
+	if(debug) print_hash(sha_master, 32);
 
 	for(int i = 0;i<32;i++){
-		out_i = i%out_len;
-		res[out_i] = get_ascii_char(pass_type, (res[out_i] + sha_site[i] + sha_master[i]));
+		out_i = i%pass_req.length;
+		res[out_i] = get_ascii_char(pass_req, (res[pass_req.length] + sha_site[i] + sha_master[i]));
 	}
-	res[out_len] = '\0';
+	res[pass_req.length] = '\0';
 }
 
 char* trim_url(char* in){
@@ -116,8 +123,10 @@ char* trim_url(char* in){
 		for(;match && curr_pat[j] && out[j];j++)
 			if(curr_pat[j] != out[j])
 				match = false;
-		if(match)
+		if(match){
+			_dprintf("Trimmed out %s\n", patterns[i]);
 			out += j;
+		}
 	}
 	// remove terminating forward slash
 	size_t out_len = strlen(out);
@@ -126,45 +135,67 @@ char* trim_url(char* in){
 	return out;
 }
 
-int register_website_requirements(const char* domain, unsigned int pass_type){
+int register_website_requirements(const char* domain, password_requirement_t pass_req){
 	const char config_file[] = "./websites.lst";
 	FILE* config = fopen(config_file, "a");
 	if(config == NULL)
 		return EXIT_FAILURE;
-	fprintf(config, "%s:%u\n", domain, pass_type);
+	fprintf(config, "%s:%u:%u\n", domain, pass_req.type, pass_req.length);
 	fclose(config);
 	return EXIT_SUCCESS;
 }
 
-int get_website_requirements(const char* domain, unsigned int *pass_type){
+char* get_line_start(char* l){
+	char* c = l;
+	while(*c && isblank(*c))
+		c++;
+	return c;
+}
+
+int get_website_config_line(const char* domain, int* line_number, char* config_line){
 	const char config_file[] = "./websites.lst";
 	FILE* config = fopen(config_file, "r+");
 	if(config == NULL)
 		goto fail;
 
 	char* current_line = NULL;
+	int current_line_number = 0;
 	size_t current_line_size = 0;
 	while(getline(&current_line, &current_line_size, config) >= 0){
-		if(strlen(current_line) < 3) continue;
 
+		current_line_number++;
+
+		// if(strlen(current_line) < 3) continue; Not sure actually.........;
+
+		if(isblank(current_line[0])) // check for blank padding
+			current_line = get_line_start(current_line);
+
+		if(current_line[0] == '#') // it's a comment line.
+			continue;
+
+		char* delim; // ':' delimiters positions
 		char current_domain[100] = {'\0'};
-		unsigned int current_requirement;
-		char* delim = strchr(current_line, ':');
+
+		// find the end of the domain part in the line
+		delim = strchr(current_line, ':');
 		if(delim == NULL){
 			fclose(config);
 			goto fail;
 		}
-		current_requirement = strtol(delim+1, NULL, 10);
-		if(errno == EINVAL){
-			fclose(config);
-			goto fail;
-		}
+
+		// check this is the right domain (and so the right line)
 		memcpy(current_domain, current_line, delim-current_line);
-		if(strcmp(domain, current_domain) == 0){
-			*pass_type = current_requirement;
-			fclose(config);
-			return 0;
-		}
+		if(strcmp(domain, current_domain) != 0)
+			continue;
+
+		*line_number = current_line_number;
+
+		if(config_line != NULL)
+			memcpy(config_line, current_line, current_line_size);
+
+		fclose(config);
+		return 0;
+
 	}
 	fclose(config);
 	return 1;
@@ -174,7 +205,58 @@ fail:
 	return -1;
 }
 
+int get_website_requirements(const char* domain, password_requirement_t *pass_req){
+
+	char current_line[200];
+	int line_number = 0; // dummy
+	int  err = 0;
+	
+	if( (err = get_website_config_line(domain, &line_number, current_line)) == 1)
+		return 1;
+	else if(err < 0)
+		return -1;
+
+	char* delim; // ':' delimiters positions
+	password_requirement_t current_requirement;
+
+	// find the end of the domain part in the line and thus the start of password type
+	delim = strchr(current_line, ':');
+	if(delim == NULL){
+		goto fail;
+	}
+
+	// read the password type from the line
+	current_requirement.type = strtol(delim+1, NULL, 10);
+	if(errno == EINVAL){
+		goto fail;
+	}
+
+	// find the password length (note : strRchr)
+	delim = strrchr(current_line, ':'); // cannot fail, or we would've gotoed fail before the first time.
+	current_requirement.length = strtol(delim+1, NULL, 10);
+	if(errno == EINVAL){
+		goto fail;
+	}
+
+	*pass_req = current_requirement;
+	return 0;
+
+fail:
+	fprintf(stderr, "Corrupted syntax in config file.\n");
+	return -1;
+}
+
 int remove_website_requirement(const char* domain){
+
+	int err;
+	int website_line_number;
+
+	if( (err = get_website_config_line(domain, &website_line_number, NULL)) == 1)
+		return 1; // line not found
+	else if(err < 0)
+		return -1; // file or syntax error.
+	_dprintf("Website line to be replaced : %d\n", website_line_number);
+
 	const char config_file[] = "./websites.lst";
 	const char tmp_file[] = "./websites.lst.tmp";
 	FILE* config = fopen(config_file, "r+");
@@ -183,27 +265,25 @@ int remove_website_requirement(const char* domain){
 		goto fail;
 
 	char* current_line = NULL;
+	int current_line_number = 0;
 	size_t current_line_size = 0;
 	while(getline(&current_line, &current_line_size, config) >= 0){
-		if(strlen(current_line) < 3) continue;
 
-		char current_domain[100] = {'\0'};
-		char* delim = strchr(current_line, ':');
-		if(delim == NULL){
-			fclose(config);
-			goto fail;
+		// we skip the target line
+		if(++current_line_number == website_line_number){
+			_dprintf("Skipping line %d during copy.\n", current_line_number);
+			continue;
 		}
-		memcpy(current_domain, current_line, delim-current_line);
-		if(strcmp(domain, current_domain) != 0)
-			fprintf(tmp, "%s", current_line);
+		
+		//if(strlen(current_line) < 3) continue; Not sure actually.........
+		fprintf(tmp, "%s", current_line);
 	}
 	fclose(config);
 	fclose(tmp);
 	if(rename(tmp_file, config_file) == 0)
 		return EXIT_SUCCESS;
-	else{
+	else
 		fprintf(stderr, "Error while removing old website config.\n");
-	}
 
 fail:
 	fprintf(stderr, "Missing or corrupted syntax in config file.\n");
@@ -217,11 +297,10 @@ int main(int argc, char* argv[]){
 		return EXIT_FAILURE;
 	}
 
+	password_requirement_t pass_req = { .type = TYPE_ALL, .length = 10};
 	bool edit_website = false;
-	int pass_len = 10;
-	unsigned int pass_type = TYPE_ALL;
 	bool default_config = true;
-	#define IF_DEFAULT_RESET do{ if(default_config){ default_config = false; pass_type = 0; } }while(0);
+	#define IF_DEFAULT_RESET do{ if(default_config){ default_config = false; pass_req.type = 0; } }while(0);
 	int index;
 	int c;
 
@@ -233,38 +312,39 @@ int main(int argc, char* argv[]){
 				break;
 			case 'U':
 				IF_DEFAULT_RESET
-				pass_type |= TYPE_UPPER;
+				pass_req.type |= TYPE_UPPER;
 				edit_website = true;
 				break;
 			case 'l':
 				IF_DEFAULT_RESET
-				pass_type |= TYPE_LOWER;
+				pass_req.type |= TYPE_LOWER;
 				edit_website = true;
 				break;
 			case 'n':
 				IF_DEFAULT_RESET
-				pass_type |= TYPE_NUMBER;
+				pass_req.type |= TYPE_NUMBER;
 				edit_website = true;
 				break;
 			case 'x':
 				IF_DEFAULT_RESET
-				pass_type |= TYPE_LOWER;
-				pass_type |= TYPE_NUMBER;
+				pass_req.type |= TYPE_LOWER;
+				pass_req.type |= TYPE_NUMBER;
 				edit_website = true;
 				break;
 			case 'X':
 				IF_DEFAULT_RESET
-				pass_type |= TYPE_UPPER;
-				pass_type |= TYPE_NUMBER;
+				pass_req.type |= TYPE_UPPER;
+				pass_req.type |= TYPE_NUMBER;
 				edit_website = true;
 				break;
 			case 's':
 				IF_DEFAULT_RESET
-				pass_type |= TYPE_SPECIAL;
+				pass_req.type |= TYPE_SPECIAL;
 				edit_website = true;
 				break;
 			case 'L':
-				pass_len = strtol(optarg, NULL, 10);
+				pass_req.length = strtol(optarg, NULL, 10);
+				default_config = false;
 				if(errno == EINVAL){
 					fprintf(stderr, "Invalid password size specified.\n");
 					print_usage();
@@ -285,30 +365,26 @@ int main(int argc, char* argv[]){
 		}
 	}
 	index = optind;
-/*
-	char domain[100] = {'\0'};
-	strncpy(domain, argv[index], 100 - 1);
-*/
+
 	char *domain = trim_url(argv[index]);
 
-	if(debug)
-		printf("Options : %u\n", pass_type);
+	_dprintf("Options : type:len = %u\%un", pass_req.type, pass_req.length);
 
 	printf("Domain : %s\n", domain);
 
-	unsigned int old_pass_type;
-	int err = get_website_requirements(domain, &old_pass_type);
-	if(err == 0){
-		if(edit_website && default_config == false){
+	password_requirement_t old_pass_req;
+	int err = get_website_requirements(domain, &old_pass_req);
+	if(err == 0){ // site already in memory
+		if(edit_website && default_config == false){ // We supply different requirements than the onses saved
 			do{
-				printf("Replacing password type for website %s : %d -> %d ? (y/n) ", domain, old_pass_type, pass_type);
+				printf("Replacing password type:length for website %s  %u:%u -> %u:%u ? (y/n) ", domain, old_pass_req.type, old_pass_req.length, pass_req.type, pass_req.length);
 				c = getchar();
 				putchar('\n');
 			}while(c != 'y' && c != 'n');
 
 			if(c == 'y'){
 				if(	remove_website_requirement(domain) == EXIT_SUCCESS && 
-					register_website_requirements(domain, pass_type) == EXIT_SUCCESS)
+					register_website_requirements(domain, pass_req) == EXIT_SUCCESS)
 					printf("Website config updated. ");
 				else{
 					fprintf(stderr, "Error while updating website config. Aborting.\n");
@@ -318,14 +394,14 @@ int main(int argc, char* argv[]){
 				printf("Change aborted.\n");
 		}else{
 			printf("Website already registered. ");
-			pass_type = old_pass_type;
+			pass_req = old_pass_req;
 		}
 
-		printf("Using password type : %u\n", pass_type);
+		printf("Using password req : %u:%u\n", pass_req.type, pass_req.length);
 	}
 	else if(err == 1){
-		if(register_website_requirements(domain, pass_type) == EXIT_SUCCESS)
-			printf("Website config inseted\n");
+		if(register_website_requirements(domain, pass_req) == EXIT_SUCCESS)
+			printf("Website config inserted\n");
 		else{
 			fprintf(stderr, "Error while inserting website config. Aborting.\n");
 			exit(EXIT_FAILURE);
@@ -335,12 +411,12 @@ int main(int argc, char* argv[]){
 		return EXIT_FAILURE;
 
 	char master_pass[100] = {'\0'};
-	char* output = calloc(pass_len + 1, 1);
+	char* output = calloc(pass_req.length + 1, 1);
 
 	while(strlen(master_pass) == 0)
 		strcpy(master_pass, getpass("Master password : "));
 
-	gen_pass(master_pass, domain, output, pass_len, pass_type);
+	gen_pass(master_pass, domain, output, pass_req);
 	printf("Password : %s\n", output);
 
 	return EXIT_SUCCESS;
